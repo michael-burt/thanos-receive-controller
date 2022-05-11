@@ -536,14 +536,10 @@ func (c *controller) sync(ctx context.Context) {
 					start := time.Now()
 					podName := fmt.Sprintf("%s-%d", sts.Name, i)
 
-					if err := c.waitForPod(podName, time.Minute); err != nil {
+					if err := c.waitForPod(ctx, podName); err != nil {
 						level.Warn(c.logger).Log("msg", "failed polling until pod is ready", "pod", podName, "duration", time.Since(start), "err", err)
 						continue
 					}
-
-				if err := c.waitForPod(ctx, podName); err != nil {
-					level.Warn(c.logger).Log("msg", "failed polling until pod is ready", "pod", podName, "duration", time.Since(start), "err", err)
-					continue
 				}
 			}
 			time.Sleep(c.options.scaleTimeout) // Give some time for all replicas before they receive hundreds req/s
@@ -594,7 +590,7 @@ func (c *controller) populate(hashrings []receive.HashringConfig, statefulsets m
 					podName := fmt.Sprintf("%s-%d", sts.Name, i)
 
 					// Check if the pods are in the Running status with a timeout of 3 seconds.
-					if err := c.waitForPod(podName, time.Second*3); err != nil {
+					if err := c.waitForPod(nil, podName); err != nil {
 						level.Warn(c.logger).Log("msg", "failed polling until pod is ready", "pod", podName, "err", err)
 						continue
 					}
