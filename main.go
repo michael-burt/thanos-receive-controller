@@ -547,6 +547,7 @@ func (c *controller) sync(ctx context.Context) {
 
 		c.replicas[hashring] = *sts.Spec.Replicas
 		statefulsets[hashring] = sts.DeepCopy()
+
 		time.Sleep(c.options.scaleTimeout) // Give some time for all replicas before they receive hundreds req/s
 	}
 
@@ -610,6 +611,7 @@ func (c *controller) populate(hashrings []receive.HashringConfig, statefulsets m
 				if c.options.clusterDomain != "" {
 					clusterDomain = fmt.Sprintf(".%s", c.options.clusterDomain)
 				}
+
 				endpoints = append(endpoints,
 					fmt.Sprintf("%s-%d.%s.%s.svc%s:%d",
 						sts.Name,
