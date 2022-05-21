@@ -29,12 +29,12 @@ import (
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/util/wait"
 	appsinformers "k8s.io/client-go/informers/apps/v1"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
+	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 )
 
 type label = string
@@ -59,18 +59,18 @@ const (
 
 func main() {
 	config := struct {
-		KubeConfig               string
-		Namespace                string
-		StatefulSetLabel         string
-		ClusterDomain            string
-		ConfigMapName            string
-		ConfigMapGeneratedName   string
-		FileName                 string
-		Port                     int
-		Scheme                   string
-		InternalAddr             string
-		AllowOnlyRunningReplicas bool
-		ScaleTimeout             time.Duration
+		KubeConfig             string
+		Namespace              string
+		StatefulSetLabel       string
+		ClusterDomain          string
+		ConfigMapName          string
+		ConfigMapGeneratedName string
+		FileName               string
+		Port                   int
+		Scheme                 string
+		InternalAddr           string
+		AllowOnlyReadyReplicas bool
+		ScaleTimeout           time.Duration
 	}{}
 
 	flag.StringVar(&config.KubeConfig, "kubeconfig", "", "Path to kubeconfig")
@@ -83,7 +83,7 @@ func main() {
 	flag.IntVar(&config.Port, "port", defaultPort, "The port on which receive components are listening for write requests")
 	flag.StringVar(&config.Scheme, "scheme", "http", "The URL scheme on which receive components accept write requests")
 	flag.StringVar(&config.InternalAddr, "internal-addr", ":8080", "The address on which internal server runs")
-	flag.BoolVar(&config.AllowOnlyRunningReplicas, "allow-only-running-replicas", false, "The flag enables Hashring to contain addresses of Thanos Receive replicas in the Running status")
+	flag.BoolVar(&config.AllowOnlyReadyReplicas, "allow-only-ready-replicas", false, "Populate only Thanos Receive replicas in the Ready condition to the hashring ConfigMap")
 	flag.DurationVar(&config.ScaleTimeout, "scale-timeout", defaultScaleTimeout, "A timeout to wait for receivers to really start after they report healthy")
 	flag.Parse()
 
@@ -117,17 +117,17 @@ func main() {
 	}
 	{
 		opt := &options{
-			clusterDomain:            config.ClusterDomain,
-			configMapName:            config.ConfigMapName,
-			configMapGeneratedName:   config.ConfigMapGeneratedName,
-			fileName:                 config.FileName,
-			namespace:                config.Namespace,
-			port:                     config.Port,
-			scheme:                   config.Scheme,
-			labelKey:                 labelKey,
-			labelValue:               labelValue,
-			allowOnlyRunningReplicas: config.AllowOnlyRunningReplicas,
-			scaleTimeout:             config.ScaleTimeout,
+			clusterDomain:          config.ClusterDomain,
+			configMapName:          config.ConfigMapName,
+			configMapGeneratedName: config.ConfigMapGeneratedName,
+			fileName:               config.FileName,
+			namespace:              config.Namespace,
+			port:                   config.Port,
+			scheme:                 config.Scheme,
+			labelKey:               labelKey,
+			labelValue:             labelValue,
+			allowOnlyReadyReplicas: config.AllowOnlyReadyReplicas,
+			scaleTimeout:           config.ScaleTimeout,
 		}
 		c := newController(klient, logger, opt)
 		c.registerMetrics(reg)
@@ -299,17 +299,17 @@ func (p prometheusReflectorMetrics) NewLastResourceVersionMetric(name string) ca
 }
 
 type options struct {
-	clusterDomain            string
-	configMapName            string
-	configMapGeneratedName   string
-	fileName                 string
-	namespace                string
-	port                     int
-	scheme                   string
-	labelKey                 string
-	labelValue               string
-	allowOnlyRunningReplicas bool
-	scaleTimeout             time.Duration
+	clusterDomain          string
+	configMapName          string
+	configMapGeneratedName string
+	fileName               string
+	namespace              string
+	port                   int
+	scheme                 string
+	labelKey               string
+	labelValue             string
+	allowOnlyReadyReplicas bool
+	scaleTimeout           time.Duration
 }
 
 type controller struct {
@@ -527,26 +527,9 @@ func (c *controller) sync(ctx context.Context) {
 		if !ok {
 			continue
 		}
-		// For scale up, a replica turning from Ready to non-Ready status cases, readiness is checked right before adding a replica to the hashring.
-		if !c.options.allowOnlyRunningReplicas {
-			// If there's an increase in replicas we poll for the new replicas to be ready
-			if _, ok := c.replicas[hashring]; ok && c.replicas[hashring] < *sts.Spec.Replicas {
-				// Iterate over new replicas to wait until they are running
-				for i := c.replicas[hashring]; i < *sts.Spec.Replicas; i++ {
-					start := time.Now()
-					podName := fmt.Sprintf("%s-%d", sts.Name, i)
-
-					if err := c.waitForPod(ctx, podName); err != nil {
-						level.Warn(c.logger).Log("msg", "failed polling until pod is ready", "pod", podName, "duration", time.Since(start), "err", err)
-						continue
-					}
-				}
-			}
-			time.Sleep(c.options.scaleTimeout) // Give some time for all replicas before they receive hundreds req/s
-		}
-
 		c.replicas[hashring] = *sts.Spec.Replicas
 		statefulsets[hashring] = sts.DeepCopy()
+		time.Sleep(c.options.scaleTimeout) // Give some time for all replicas before they receive hundreds req/s
 	}
 
 	c.populate(hashrings, statefulsets)
@@ -557,26 +540,6 @@ func (c *controller) sync(ctx context.Context) {
 	}
 }
 
-func (c controller) waitForPod(ctx context.Context, name string) error {
-	return wait.PollImmediate(time.Second, time.Minute, func() (bool, error) {
-		pod, err := c.klient.CoreV1().Pods(c.options.namespace).Get(ctx, name, metav1.GetOptions{})
-		if kerrors.IsNotFound(err) {
-			return false, nil
-		}
-		if err != nil {
-			return false, err
-		}
-		switch pod.Status.Phase {
-		case corev1.PodRunning:
-			return true, nil
-		case corev1.PodFailed, corev1.PodPending, corev1.PodSucceeded, corev1.PodUnknown:
-			return false, nil
-		default:
-			return false, nil
-		}
-	})
-}
-
 func (c *controller) populate(hashrings []receive.HashringConfig, statefulsets map[string]*appsv1.StatefulSet) {
 	for i, h := range hashrings {
 		if sts, exists := statefulsets[h.Hashring]; exists {
@@ -584,14 +547,16 @@ func (c *controller) populate(hashrings []receive.HashringConfig, statefulsets m
 
 			for i := 0; i < int(*sts.Spec.Replicas); i++ {
 
-				// Do not add a replica to the hashring if polling fails.
-				if c.options.allowOnlyRunningReplicas {
+				// Do not add a replica to the hashring if pod is not Ready.
+				if c.options.allowOnlyReadyReplicas {
 
 					podName := fmt.Sprintf("%s-%d", sts.Name, i)
-
-					// Check if the pods are in the Running status with a timeout of 3 seconds.
-					if err := c.waitForPod(nil, podName); err != nil {
-						level.Warn(c.logger).Log("msg", "failed polling until pod is ready", "pod", podName, "err", err)
+					pod, err := c.klient.CoreV1().Pods(c.options.namespace).Get(nil, podName, metav1.GetOptions{})
+					if kerrors.IsNotFound(err) {
+						continue
+					}
+					if !podutil.IsPodReady(pod) {
+						level.Warn(c.logger).Log("msg", "failed adding pod to hashring, pod not ready", "pod", podName, "err", err)
 						continue
 					}
 				}
