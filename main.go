@@ -29,6 +29,7 @@ import (
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/wait"
 	appsinformers "k8s.io/client-go/informers/apps/v1"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
@@ -527,6 +528,23 @@ func (c *controller) sync(ctx context.Context) {
 		if !ok {
 			continue
 		}
+
+		// If there's an increase in replicas we poll for the new replicas to be ready
+		if _, ok := c.replicas[hashring]; ok && c.replicas[hashring] < *sts.Spec.Replicas {
+			// Iterate over new replicas to wait until they are running
+			for i := c.replicas[hashring]; i < *sts.Spec.Replicas; i++ {
+				start := time.Now()
+				podName := fmt.Sprintf("%s-%d", sts.Name, i)
+
+				if err := c.waitForPod(ctx, podName); err != nil {
+					level.Warn(c.logger).Log("msg", "failed polling until pod is ready", "pod", podName, "duration", time.Since(start), "err", err)
+					continue
+				}
+
+				level.Debug(c.logger).Log("msg", "waited until new pod was ready", "pod", podName, "duration", time.Since(start))
+			}
+		}
+
 		c.replicas[hashring] = *sts.Spec.Replicas
 		statefulsets[hashring] = sts.DeepCopy()
 		time.Sleep(c.options.scaleTimeout) // Give some time for all replicas before they receive hundreds req/s
@@ -538,6 +556,32 @@ func (c *controller) sync(ctx context.Context) {
 		c.reconcileErrors.WithLabelValues(save).Inc()
 		level.Error(c.logger).Log("msg", "failed to save hashrings")
 	}
+}
+
+func (c controller) waitForPod(ctx context.Context, name string) error {
+	return wait.PollImmediate(time.Second, time.Minute, func() (bool, error) {
+		pod, err := c.klient.CoreV1().Pods(c.options.namespace).Get(ctx, name, metav1.GetOptions{})
+		if kerrors.IsNotFound(err) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		switch pod.Status.Phase {
+		case corev1.PodRunning:
+			if c.options.allowOnlyReadyReplicas {
+				if podutil.IsPodReady(pod) {
+					return true, nil
+				}
+				return false, nil
+			}
+			return true, nil
+		case corev1.PodFailed, corev1.PodPending, corev1.PodSucceeded, corev1.PodUnknown:
+			return false, nil
+		default:
+			return false, nil
+		}
+	})
 }
 
 func (c *controller) populate(hashrings []receive.HashringConfig, statefulsets map[string]*appsv1.StatefulSet) {
